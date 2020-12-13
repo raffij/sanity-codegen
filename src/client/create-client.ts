@@ -14,6 +14,10 @@ interface SanityResult<T> {
   result: T[];
 }
 
+type Id = { id: string };
+type Projection<T, R extends keyof T> = { select?: Array<R> };
+type Filter = { where?: string };
+
 function createClient<Documents extends { _type: string; _id: string }>({
   dataset,
   projectId,
@@ -21,6 +25,11 @@ function createClient<Documents extends { _type: string; _id: string }>({
   previewMode = false,
   fetch,
 }: CreateClientOptions) {
+  /**
+   * narrows in on the type of the document by using a union
+   */
+  type SanityDoc<T extends string> = Documents & { _type: T };
+
   async function jsonFetch<T>(url: RequestInfo, options?: RequestInit) {
     const response = await fetch(url, {
       ...options,
@@ -39,22 +48,49 @@ function createClient<Documents extends { _type: string; _id: string }>({
    * If previewMode is true and a token is provided, then the client will prefer
    * drafts over the published version.
    */
+  // NOTE: order of these overloads are important
+  async function get<T extends Documents['_type']>(
+    _type: T,
+    options: Id
+  ): Promise<SanityDoc<T> | null>;
+
+  async function get<
+    T extends Documents['_type'],
+    R extends keyof SanityDoc<T>
+  >(
+    _type: T,
+    options: Id & Projection<SanityDoc<T>, R>
+  ): Promise<Pick<SanityDoc<T>, R> | null>;
+
+  async function get<T extends Documents['_type']>(
+    _type: T,
+    id: string
+  ): Promise<SanityDoc<T> | null>;
+
   async function get<T extends Documents['_type']>(
     // NOTE: type is exclusively for typescript, it's not actually used in code
     _type: T,
-    id: string
-  ) {
-    type R = Documents & { _type: T };
+    arg: string | (Id & Projection<SanityDoc<T>, any>)
+  ): Promise<SanityDoc<T> | null> {
     const searchParams = new URLSearchParams();
     const preview = previewMode && !!token;
+    const id = typeof arg === 'object' ? arg.id : arg;
+    const selection = typeof arg === 'object' ? arg.select || [] : [];
+
     const previewClause = preview
       ? // sanity creates a new document with an _id prefix of `drafts.`
         // for when a document is edited without being published
         `|| _id=="drafts.${id}"`
       : '';
+    const projectionClause = selection.length
+      ? ` { ${selection.join(', ')} }`
+      : '';
 
-    searchParams.set('query', `* [_id == "${id}" ${previewClause}]`);
-    const response = await jsonFetch<SanityResult<R>>(
+    searchParams.set(
+      'query',
+      `* [_id == "${id}" ${previewClause}]${projectionClause}`
+    );
+    const response = await jsonFetch<SanityResult<SanityDoc<T>>>(
       `https://${projectId}.api.sanity.io/v1/data/query/${dataset}?${searchParams.toString()}`,
       {
         // conditionally add the authorization header if the token is present
@@ -78,22 +114,44 @@ function createClient<Documents extends { _type: string; _id: string }>({
    * Gets all the documents of a particular type. In preview mode, if a document
    * has a draft, that will be returned instead.
    */
+  // NOTE: order of these overloads are important
+  async function getAll<T extends Documents['_type']>(
+    type: T,
+    options?: Filter
+  ): Promise<Array<SanityDoc<T>>>;
+
+  async function getAll<
+    T extends Documents['_type'],
+    R extends keyof SanityDoc<T>
+  >(
+    type: T,
+    options?: Filter & Projection<SanityDoc<T>, R>
+  ): Promise<Array<Pick<SanityDoc<T>, R>>>;
+
   async function getAll<T extends Documents['_type']>(
     type: T,
     filterClause?: string
-  ) {
-    // force typescript to narrow the type using the intersection.
-    // TODO: might be a cleaner way to do this. this creates an ugly lookin type
-    type R = { _type: T } & Documents;
+  ): Promise<Array<SanityDoc<T>>>;
 
+  async function getAll<T extends Documents['_type']>(
+    type: T,
+    arg?: string | (Filter & Projection<SanityDoc<T>, any>)
+  ): Promise<Array<SanityDoc<T>>> {
     const searchParams = new URLSearchParams();
     const preview = previewMode && !!token;
+    const filter = typeof arg === 'object' ? arg.where : arg;
+    const selection = typeof arg === 'object' ? arg.select || [] : [];
+
+    const filterClause = filter ? ` && ${filter}` : '';
+    const projectionClause = selection.length
+      ? ` { ${selection.join(', ')} }`
+      : '';
 
     searchParams.set(
       'query',
-      `* [_type == "${type}"${filterClause ? ` && ${filterClause}` : ''}]`
+      `* [_type == "${type}"${filterClause}]${projectionClause}`
     );
-    const response = await jsonFetch<SanityResult<R>>(
+    const response = await jsonFetch<SanityResult<SanityDoc<T>>>(
       `https://${projectId}.api.sanity.io/v1/data/query/${dataset}?${searchParams.toString()}`,
       {
         // conditionally add the authorization header if the token is present
@@ -113,14 +171,14 @@ function createClient<Documents extends { _type: string; _id: string }>({
     // create a lookup of only draft docs
     const draftDocs = response.result
       .filter((doc) => doc._id.startsWith('drafts.'))
-      .reduce<{ [_id: string]: R }>((acc, next) => {
+      .reduce<{ [_id: string]: SanityDoc<T> }>((acc, next) => {
         acc[removeDraftPrefix(next._id)] = next;
         return acc;
       }, {});
 
     // in this dictionary, if there is draft doc, that will be preferred,
     // otherwise it'll use the published version
-    const finalAcc = response.result.reduce<{ [_id: string]: R }>(
+    const finalAcc = response.result.reduce<{ [_id: string]: SanityDoc<T> }>(
       (acc, next) => {
         const id = removeDraftPrefix(next._id);
         acc[id] = draftDocs[id] || next;
@@ -136,11 +194,26 @@ function createClient<Documents extends { _type: string; _id: string }>({
    * If a sanity document refers to another sanity document, then you can use this
    * function to expand that document, preserving the type
    */
-  async function expand<T extends Documents>(ref: SanityReference<T>) {
+  async function expand<T extends Documents, R extends keyof T>(
+    ref: SanityReference<T>,
+    options?: Projection<T, R>
+  ): Promise<Pick<T, R>>;
+
+  async function expand<T extends Documents>(
+    ref: SanityReference<T>
+  ): Promise<T>;
+
+  async function expand<T extends Documents>(
+    ref: SanityReference<T>,
+    arg?: Projection<T, any>
+  ): Promise<T> {
     // this function is primarily for typescript
-    const response = await get<T['_type']>(null as any, ref._ref);
+    const response = await get<T['_type']>(null as any, {
+      id: ref._ref,
+      ...arg,
+    });
     // since this is a ref, the response will be defined (unless weak reference)
-    return response!;
+    return (response as T)!;
   }
 
   return { get, getAll, expand };
